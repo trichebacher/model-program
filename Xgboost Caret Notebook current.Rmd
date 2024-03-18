@@ -1,0 +1,455 @@
+---
+title: "R modeling notebook"
+output: html_notebook
+---
+
+# [CALL LIBRARIES]{.underline}
+
+```{r}
+  
+
+.libPaths("C:/Users/trich/OneDrive/R_code/rtest/R_testing/renv/library/R-4.3/x86_64-w64-mingw32")
+
+
+# 1. Load required libraries
+library(data.table)
+library(xgboost)
+library(caret)  # For cross-validation
+library(fst)
+library(pROC)  #for ROC curve
+library(lintr)
+library(formatR)
+library(janitor)
+```
+
+# [START PARALLEL PROCESS]{.underline}
+
+```{r}
+library(doParallel)
+detectCores()
+
+registerDoParallel(cores = 8)
+```
+
+# [INITIALIZE GLOBAL VARIABLES]{.underline}
+
+```{r}
+options(scipen = 999)
+set.seed(419)
+use.integer64 <- FALSE
+
+#"REG" = regression, "B_CLASS" = binary class, "M_CLASS" = multiclass
+analysis_type <- "REG"
+input_files <- 2
+project <- "Home Price"
+
+project_path <- getwd()
+
+#"REG" = regression, "B_CLASS" = binary class, "M_CLASS" = multiclass
+analysis_type <- "REG"
+input_files <- "2"
+project <- "Credit"
+report_path <- paste0(project_path, "/reports/")
+data_input_path <- paste0(project_path, "/data_input/")
+data_modeling_path <- paste0(project_path, "/data_modeling/")
+
+model_name <- "xgboost"
+
+```
+
+# MODEL PARAMETERS
+
+```{r}
+#for low % of samples in one class use metric = "Kappa"
+if (analysis_type == 'B_CLASS') {
+  metric_m <- "ROC" 
+  class_probs <- TRUE
+} else if (analysis_type == 'M_CLASS') {
+  metric_m <- "Accuracy"
+} else {
+  metric_m <- "RMSE"
+  scoring = c("RMSE", "Rsquared")
+  class_probs <- FALSE
+}
+```
+
+# CROSS VALIDATION PARAMETERS
+
+```{r}
+#Set up cross-validation
+fitcontrol <- trainControl(method = "cv",  #cv, adaptivecv
+                        number =  2,
+                        #repeats = 20,
+                        verboseIter = TRUE,
+                        returnData = TRUE,
+                        #search = "random",      
+                        #adaptive = list(min = 5, alpha = 0.05, 
+                        #                     method = "gls", complete = TRUE),
+                        #                        returnResamp = "all", 
+                        timingSamps = 100,
+                        savePredictions = "final",
+                        classProbs = class_probs,
+                        seeds = NA,
+                        allowParallel = TRUE)
+```
+
+# GRID SEARCH DESIGN
+
+```{r eval=FALSE, include=FALSE}
+if (model_name == "xgboost") {
+xgb_grid <- expand.grid(
+  nrounds = seq(120, 180, 25),
+  max_depth = c(1, 3, 6),
+  eta = c(0.05, 0.06, 0.04),
+  gamma = c(0.15, 0.2, 0.25),
+  colsample_bytree = c(0.75, 0.8, 0.85),
+  min_child_weight = c(2, 3, 4),
+  subsample = c(0.75, 0.8, 0.85))
+}
+```
+
+# MY FUNCTIONS
+
+```{r}
+create_sample <- function(data_in, sample_size = 50000) {
+
+  if (nrow(data_in) > sample_size) {
+    data_sample <- data_in[sample(nrow(data_in), sample_size, replace = FALSE), ]
+  } else {
+    data_sample <- data_in
+  }
+  return(data_sample)
+}
+```
+
+# [GET FILES]{.underline}
+
+## Read data
+
+```{r}
+
+# Call function to read in data files
+if (input_files == 1) {
+  train_dt_treated <- read.fst(paste0(data_modeling_path, "DT.fst"))
+} else if (input_files == 2) {
+  train_dt_treated <- read_fst(paste0(data_modeling_path,
+                           "DT_train_treated.fst"),
+                           as.data.table = TRUE)
+  score_dt_treated <- read_fst(paste0(data_modeling_path,
+                           "DT_test_treated.fst"),
+                           as.data.table = TRUE)
+
+}
+
+```
+
+## Partition data into training and validation sets
+
+```{r}
+# Use 'p' to specify the fraction of data for the training set
+
+train_index <- createDataPartition(y = train_dt_treated$target, p = 0.8, list = FALSE)
+train_dt <- train_dt_treated[train_index, ]
+valid_dt <- train_dt_treated[-train_index, ]
+
+dim(train_dt)
+dim(valid_dt)
+rm(train_dt_treated, train_index)
+```
+
+# [MODELING PREP STEPS]{.underline}
+
+## nzv removal
+
+```{r}
+train_sample <- create_sample(train_dt)
+
+nzv_cols <- nearZeroVar(
+  train_sample[, -c('target', 'Id')], 
+  names = TRUE,
+  saveMetrics = TRUE,   #make TRUE to run report
+  freqCut = 95/5,
+  uniqueCut = 10,
+  allowParallel = TRUE)
+
+#make rownames into column
+rm_nzv_cols_dt <- data.table(rownames(nzv_cols),
+                             nzv_cols[c("freqRatio", "percentUnique", "zeroVar", "nzv")])
+
+setorder(rm_nzv_cols_dt, -freqRatio)
+
+print(rm_nzv_cols_dt[nzv == TRUE]) 
+
+rm_nzv_cols <- rm_nzv_cols_dt[nzv == TRUE, "V1"]
+rm_nzv_cols <- rm_nzv_cols$V1
+
+
+if (length(rm_nzv_cols) > 0) {
+  train_sample[, (rm_nzv_cols) := NULL]    #train_dt inherets the deletion
+  train_dt[, (rm_nzv_cols) := NULL]
+  valid_dt[, (rm_nzv_cols) := NULL]
+}
+
+# cleanup 
+rm(nzv_cols, rm_nzv_cols_dt, rm_nzv_cols)
+gc()
+```
+
+## missing value
+
+```{r}
+# Calculate missing value percentage by column
+missing_percentages <- round((colSums(is.na(train_sample)) / nrow(train_sample)) * 100, 2)[colSums(is.na(train_sample)) > 0]
+
+missing_percentages <- sort(missing_percentages, decreasing = TRUE)
+print(missing_percentages)
+
+if (length(missing_percentages > 0)) {
+ggplot(data = data.frame(column = names(missing_percentages),
+                         missing_pct = missing_percentages), 
+       aes(x = column, y = missing_percentages)) +
+ geom_bar(stat = "identity", fill = "steelblue") +
+ labs(title = "Percentage of Missing Values by Column", 
+      x = "Column Name", y = "Missing Values (%)") +
+ theme_minimal() +
+ coord_flip() # Optional for horizontal bars
+}
+rm(missing_percentages)
+```
+
+## Corr analysis and removal
+
+```{r}
+#get all numeric columns names without missing values
+num_cols <- setdiff(names(train_sample)[sapply(train_dt,
+                    function(x) is.numeric(x) && !anyNA(x))],
+                    c("Id", 'target'))
+
+cor_matrix <- cor(train_sample[, ..num_cols],
+                  use = "pairwise.complete.obs")
+
+#Create a data frame for flexible formatting and analysis
+correlation_df <- reshape2::melt(cor_matrix,
+                                 value.name = "Correlation")
+
+#find high correlation variables
+filtered_correlation_df <- correlation_df[abs(correlation_df$Correlation) > 0.80 & abs(correlation_df$Correlation) < 1, ]
+
+filtered_correlation_df
+
+#find high correlation vars to delete
+high_corr_vars <- findCorrelation(cor_matrix, cutoff = 0.80, names = TRUE)
+print(high_corr_vars)
+print(length(high_corr_vars))
+
+if (length(high_corr_vars) > 0) {
+  train_sample[, (high_corr_vars) := NULL]  #train_dt inherits the deletion
+   valid_dt[, (high_corr_vars) := NULL]
+}
+
+ 
+rm(num_cols, cor_matrix, correlation_df, filtered_correlation_df, high_corr_vars)
+```
+
+## Target variable normalization
+
+```{r eval=FALSE, include=FALSE}
+
+DT_train__model_data[, target := log(target + 1)]
+```
+
+# [RUN MODEL]{.underline}
+
+```{r}
+
+preprocess_steps <- c("medianImpute")
+
+#Train the XGBoost model using cross-validation and tuning
+start_time <- Sys.time()
+
+xgb_model <- train(
+  x = train_dt[, -c("target", "Id")],
+  y = train_dt$target,
+  method = "xgbTree",
+  trControl = fitcontrol,
+  preProcess = preprocess_steps,
+  metric = metric_m,
+  maximize = ifelse(metric_m %in% c("RMSE", "logLoss", "MAE", "logLoss"),
+                    FALSE,
+                    TRUE),
+  #tuneGrid = xgb_grid,
+  #tuneLength = 10,
+  verbose = TRUE# Optional: Display training progress
+  )
+
+end_time <- Sys.time()
+run_time <- end_time - start_time
+
+#saveRDS(xgb_model, file = paste0(data_modeling_path, file = "xgb_model.rds"))
+```
+
+# [SIMPLIFY MODEL]{.underline}
+
+```{r eval=FALSE, include=FALSE}
+#find a less complex model based on (x-xbest)/xbestx 100, which is the percent difference. For example, to select parameter values based on a 2% loss of performance
+
+whichTwoPct <- tolerance(xgb_model$results, metric = metric_m, 
+                         tol = 2, maximize = FALSE)  
+cat("best model within 2 pct of best:\n")
+
+
+xgb_model$results[whichTwoPct,1:6]
+```
+
+# [EVALUATE MODEL]{.underline}
+
+```{r}
+
+# 1. Access cross-validated performance metrics
+xgb_results <- xgb_model$results
+
+summary(xgb_results)
+
+#most important variable
+varImp(xgb_model)
+
+learning_curve <- plot(xgb_model)
+learning_curve
+
+
+plot(xgb_model, metric = "RMSE")
+# 3. View metrics for the best model (based on RMSE)
+best_model <- xgb_model$bestTune
+best_rmse <- min(xgb_results$RMSE)
+best_r2 <- max(xgb_results$Rsquared)
+cat("Best modeling RMSE:", best_rmse, "\n")
+cat("Best modeling R2:", best_r2, "\n")
+
+# 4. Visualize performance metrics (optional)
+plot(xgb_results$RMSE ~ xgb_results$nrounds, type = "l")  
+
+```
+
+## Score and evaluate holdout sample
+
+```{r}
+
+# Generate predictions using the trained model after preprocess
+pp_model <- preProcess(valid_dt, method = preprocess_steps)
+valid_dt_imputed <- predict(pp_model, valid_dt)
+predictions <- predict(xgb_model, newdata = valid_dt_imputed)
+
+# Add the predictions to the validation data.table
+valid_dt_imputed[, predicted_value := predictions]
+
+postResample(pred = predictions, obs = valid_dt_imputed$target)
+
+cat("Best validation RMSE :", best_rmse, "\n")
+```
+
+### Score submission file
+
+```{r eval=FALSE, include=FALSE}
+submission_file <- DT_test_model_data[, .(Id, predicted_value)]
+
+# Write the results to a CSV file
+fwrite(submission_file, paste0(data_modeling_path, "model_scores.csv"))
+
+```
+
+# [RUN SEGMENTATION MODELS]{.underline}
+
+### Initialize objects
+
+```{r}
+
+#create list object to collect model and scoring information
+models = list()
+
+#initialize table that contains all score and supporting data
+score_file <- data.table(
+  Id = character(),
+  target = numeric(),
+  category = character(),
+  score = numeric()
+)
+```
+
+### Create segmentation variable
+
+```{r}
+#creates the segmentation variable
+#here are different options
+train_dt[, seg_var := as.factor(ifelse(OverallQual_treat > 6, 1, 2))]
+valid_dt[, seg_var := as.factor(ifelse(OverallQual_treat > 6, 1, 2))]
+
+loop_input <- levels(train_dt$seg_var)
+#loop_input <- unique_categories[-2]  #clean what is not wanted
+```
+
+### Create segmentation models
+
+```{r}
+#loop through the segmentation
+for (category in loop_input) {
+
+#get the approriate data
+train_dt_segment <- train_dt[seg_var == category, ]
+
+#create the model
+models[[paste0("m_", category)]] <- train(
+  x = train_dt_segment[, -c("target", "Id", "seg_var", "OverallQual_treat")],
+  y = train_dt_segment$target,
+  method = "xgbTree",
+  trControl = fitcontrol,
+  preProcess = preprocess_steps,
+  metric = metric_m,
+  maximize = ifelse(metric_m %in% c("RMSE", "logLoss", "MAE", "logLoss"),
+                    FALSE,
+                    TRUE),
+  #tuneGrid = xgb_grid,
+  #tuneLength = 10,
+  verbose = FALSE# Optional: Display training progress
+)
+
+}
+```
+
+### Validation scoring
+
+```{r}
+
+for (category in loop_input) {
+#preprocess validaton- like the training sample
+pp_model <- preProcess(valid_dt[seg_var == category, -("seg_var")], method = preprocess_steps)
+
+#apply preprocessing
+valid_dt_imputed <- predict(pp_model, valid_dt[seg_var == category])
+
+#run prediction
+predictions <- round(predict(models[[paste0("m_", category)]], newdata = valid_dt_imputed),0)
+
+# fill initialized scores table 
+category_scores <- data.table(Id = valid_dt_imputed$Id, target = valid_dt_imputed$target, category = category, score = predictions)
+score_file <- rbind(score_file, category_scores)  # Append scores efficiently
+}
+```
+
+### Create evaluation metrics for segmentation models
+
+```{r paged.print=TRUE}
+for (category in loop_input) {
+model_loop_results <- models[[paste0("m_", category)]]$results
+summary(model_loop_results)
+best_model <- models[[paste0("m_", category)]]$bestTune
+best_rmse <- min(model_loop_results$RMSE)
+best_r2 <- max(model_loop_results$Rsquared)
+print(best_model)
+cat("Best modeling RMSE for category",category,":", best_rmse, "\n")
+cat("Best modeling R2 for category" ,category,":",best_r2, "\n")
+
+}
+
+validation_metric <-postResample(pred = score_file$score, obs = score_file$target)
+cat("Validation results are RMSE, Rsquared, MAE:", validation_metric)
+```
