@@ -6,10 +6,14 @@ output: html_notebook
 # [CALL LIBRARIES]{.underline}
 
 ```{r}
-  
+#.libPaths("C:/Users/trich/OneDrive/R_code/rtest/R_testing/renv/library/R-4.3/x86_64-w64-mingw32")
 
-.libPaths("C:/Users/trich/OneDrive/R_code/rtest/R_testing/renv/library/R-4.3/x86_64-w64-mingw32")
 
+#define working directory of this notebook
+knitr::opts_knit$set(root.dir = "C:/Users/trich/OneDrive/R_code/house_prices")
+
+#set the project directory
+project_path <- knitr::opts_knit$get("root.dir")
 
 # 1. Load required libraries
 library(data.table)
@@ -19,6 +23,7 @@ library(fst)
 library(pROC)  #for ROC curve
 library(lintr)
 library(formatR)
+library(DiagrammeR)
 library(janitor)
 ```
 
@@ -43,21 +48,19 @@ analysis_type <- "REG"
 input_files <- 2
 project <- "Home Price"
 
-project_path <- getwd()
-
 #"REG" = regression, "B_CLASS" = binary class, "M_CLASS" = multiclass
 analysis_type <- "REG"
 input_files <- "2"
 project <- "Credit"
 report_path <- paste0(project_path, "/reports/")
-data_input_path <- paste0(project_path, "/data_input/")
+data_input_path <- paste0(project_path, "/data_modeling/")
 data_modeling_path <- paste0(project_path, "/data_modeling/")
 
-model_name <- "xgboost"
+model_name <- "Home Prices"
 
 ```
 
-# MODEL PARAMETERS
+# MODEL TYPE PARAMETERS
 
 ```{r}
 #for low % of samples in one class use metric = "Kappa"
@@ -77,16 +80,15 @@ if (analysis_type == 'B_CLASS') {
 
 ```{r}
 #Set up cross-validation
-fitcontrol <- trainControl(method = "cv",  #cv, adaptivecv
+fitcontrol <- trainControl(method = "repeatedcv", #repeatedcv",  #cv, adaptivecv
                         number =  2,
-                        #repeats = 20,
+                        repeats = 2,
                         verboseIter = TRUE,
                         returnData = TRUE,
                         #search = "random",      
                         #adaptive = list(min = 5, alpha = 0.05, 
                         #                     method = "gls", complete = TRUE),
                         #                        returnResamp = "all", 
-                        timingSamps = 100,
                         savePredictions = "final",
                         classProbs = class_probs,
                         seeds = NA,
@@ -95,17 +97,29 @@ fitcontrol <- trainControl(method = "cv",  #cv, adaptivecv
 
 # GRID SEARCH DESIGN
 
-```{r eval=FALSE, include=FALSE}
-if (model_name == "xgboost") {
-xgb_grid <- expand.grid(
-  nrounds = seq(120, 180, 25),
-  max_depth = c(1, 3, 6),
-  eta = c(0.05, 0.06, 0.04),
-  gamma = c(0.15, 0.2, 0.25),
-  colsample_bytree = c(0.75, 0.8, 0.85),
-  min_child_weight = c(2, 3, 4),
-  subsample = c(0.75, 0.8, 0.85))
-}
+```{r}
+
+param_grid <- expand.grid(
+  max_depth = c(3, 5, 8, 10),
+  eta = c(0.01, 0.05, 0.1, 0.2),
+  subsample = c(0.5, 0.7, 0.8, 1),
+  colsample_bytree = c(0.5, 0.7, 0.8, 1),
+  gamma = c(0, 0.1, 0.3, 0.5),
+  min_child_weight = c(1, 3, 5),
+  nrounds = c(120, 150, 180)  # Include nrounds in the search grid
+)
+
+
+  
+#COMMENTS
+# max_depth: 3-10 (increase depth gradually to allow for more complex trees)
+# eta: 0.01-0.2 (explore a wider range of smaller learning rates)
+# subsample: 0.5-1 (experiment with both higher and lower subsampling)
+# colsample_bytree: 0.5-1 (similar to subsampling)
+# gamma: 0-0.5 (introduce minimum loss reduction, starting from current value)
+# min_child_weight: 1-5 (adjust weight for leaf nodes cautiously)
+# nrounds: 120-180 (start near initial value and explore small adjustments)
+
 ```
 
 # MY FUNCTIONS
@@ -132,29 +146,13 @@ create_sample <- function(data_in, sample_size = 50000) {
 if (input_files == 1) {
   train_dt_treated <- read.fst(paste0(data_modeling_path, "DT.fst"))
 } else if (input_files == 2) {
-  train_dt_treated <- read_fst(paste0(data_modeling_path,
-                           "DT_train_treated.fst"),
+  train_dt_treated <- read_fst(paste0(data_input_path, "DT_train_treated.fst"),
                            as.data.table = TRUE)
-  score_dt_treated <- read_fst(paste0(data_modeling_path,
-                           "DT_test_treated.fst"),
+  score_dt_treated <- read_fst(paste0(data_input_path, "DT_test_treated.fst"),
                            as.data.table = TRUE)
 
 }
 
-```
-
-## Partition data into training and validation sets
-
-```{r}
-# Use 'p' to specify the fraction of data for the training set
-
-train_index <- createDataPartition(y = train_dt_treated$target, p = 0.8, list = FALSE)
-train_dt <- train_dt_treated[train_index, ]
-valid_dt <- train_dt_treated[-train_index, ]
-
-dim(train_dt)
-dim(valid_dt)
-rm(train_dt_treated, train_index)
 ```
 
 # [MODELING PREP STEPS]{.underline}
@@ -162,7 +160,7 @@ rm(train_dt_treated, train_index)
 ## nzv removal
 
 ```{r}
-train_sample <- create_sample(train_dt)
+train_sample <- create_sample(train_dt_treated)
 
 nzv_cols <- nearZeroVar(
   train_sample[, -c('target', 'Id')], 
@@ -174,7 +172,7 @@ nzv_cols <- nearZeroVar(
 
 #make rownames into column
 rm_nzv_cols_dt <- data.table(rownames(nzv_cols),
-                             nzv_cols[c("freqRatio", "percentUnique", "zeroVar", "nzv")])
+                      nzv_cols[c("freqRatio", "percentUnique", "zeroVar", "nzv")])
 
 setorder(rm_nzv_cols_dt, -freqRatio)
 
@@ -186,8 +184,7 @@ rm_nzv_cols <- rm_nzv_cols$V1
 
 if (length(rm_nzv_cols) > 0) {
   train_sample[, (rm_nzv_cols) := NULL]    #train_dt inherets the deletion
-  train_dt[, (rm_nzv_cols) := NULL]
-  valid_dt[, (rm_nzv_cols) := NULL]
+  score_dt_treated[, (rm_nzv_cols) := NULL]
 }
 
 # cleanup 
@@ -219,9 +216,9 @@ rm(missing_percentages)
 
 ## Corr analysis and removal
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 #get all numeric columns names without missing values
-num_cols <- setdiff(names(train_sample)[sapply(train_dt,
+num_cols <- setdiff(names(train_sample)[sapply(train_sample,
                     function(x) is.numeric(x) && !anyNA(x))],
                     c("Id", 'target'))
 
@@ -243,8 +240,8 @@ print(high_corr_vars)
 print(length(high_corr_vars))
 
 if (length(high_corr_vars) > 0) {
-  train_sample[, (high_corr_vars) := NULL]  #train_dt inherits the deletion
-   valid_dt[, (high_corr_vars) := NULL]
+    train_sample[, (high_corr_vars) := NULL]  
+score_dt_treated[, (high_corr_vars) := NULL]
 }
 
  
@@ -255,154 +252,214 @@ rm(num_cols, cor_matrix, correlation_df, filtered_correlation_df, high_corr_vars
 
 ```{r eval=FALSE, include=FALSE}
 
-DT_train__model_data[, target := log(target + 1)]
+histogram(train_sample$target)
+#train_sample[, target := log(target + 1)]
 ```
 
-# [RUN MODEL]{.underline}
+## Preprocess all data
+
+```{r}
+#assign preprocessing methods
+preprocess_steps <- c("medianImpute")
+
+#develop preprocess model
+pp_model <- preProcess(train_sample[, -c("Id", "target")],
+                       method = preprocess_steps)
+
+#apply model
+train_dt_imputed <- predict(pp_model, train_dt_treated)
+score_dt_imputed <- predict(pp_model, score_dt_treated)
+
+rm(preprocess_steps, train_dt_treated, score_dt_treated)
+```
+
+## Partition data into training and validation sets
+
+```{r}
+train_index <- createDataPartition(y = train_dt_imputed$target,
+                                   p = 0.8, list = FALSE)
+
+train_dt_imputed <- train_dt_imputed[train_index, ]
+valid_dt_imputed <- train_dt_imputed[-train_index, ]
+
+dim(train_dt_imputed)
+dim(valid_dt_imputed)
+rm(train_index)
+```
+
+# [RUN INDIVIDUAL MODEL]{.underline}
 
 ```{r}
 
-preprocess_steps <- c("medianImpute")
+#preprocess_steps <- c("medianImpute")
 
 #Train the XGBoost model using cross-validation and tuning
-start_time <- Sys.time()
-
-xgb_model <- train(
-  x = train_dt[, -c("target", "Id")],
-  y = train_dt$target,
+my_model <- train(
+  x = train_dt_imputed[, -c("target", "Id")],
+  y = train_dt_imputed$target,
   method = "xgbTree",
   trControl = fitcontrol,
-  preProcess = preprocess_steps,
   metric = metric_m,
   maximize = ifelse(metric_m %in% c("RMSE", "logLoss", "MAE", "logLoss"),
                     FALSE,
                     TRUE),
-  #tuneGrid = xgb_grid,
+  tuneGrid = param_grid,
   #tuneLength = 10,
   verbose = TRUE# Optional: Display training progress
   )
 
-end_time <- Sys.time()
-run_time <- end_time - start_time
-
-#saveRDS(xgb_model, file = paste0(data_modeling_path, file = "xgb_model.rds"))
+saveRDS(my_model, file = paste0(data_modeling_path, file = "my_model.rds"))
 ```
 
-# [SIMPLIFY MODEL]{.underline}
+## Simplify model
 
 ```{r eval=FALSE, include=FALSE}
 #find a less complex model based on (x-xbest)/xbestx 100, which is the percent difference. For example, to select parameter values based on a 2% loss of performance
 
-whichTwoPct <- tolerance(xgb_model$results, metric = metric_m, 
+whichTwoPct <- tolerance(my_model$results, metric = metric_m, 
                          tol = 2, maximize = FALSE)  
 cat("best model within 2 pct of best:\n")
 
 
-xgb_model$results[whichTwoPct,1:6]
+my_model$results[whichTwoPct,1:6]
 ```
 
-# [EVALUATE MODEL]{.underline}
+## Evaluate model
 
-```{r}
+```{r paged.print=TRUE}
 
 # 1. Access cross-validated performance metrics
-xgb_results <- xgb_model$results
+model_results <- my_model$results
 
-summary(xgb_results)
+
+summary(my_model$results)
 
 #most important variable
-varImp(xgb_model)
+varImp(my_model)
 
-learning_curve <- plot(xgb_model)
-learning_curve
+#learning_curve <- plot(my_model)
+#learning_curve
 
 
-plot(xgb_model, metric = "RMSE")
+
+plot(my_model, metric = "RMSE")
 # 3. View metrics for the best model (based on RMSE)
-best_model <- xgb_model$bestTune
-best_rmse <- min(xgb_results$RMSE)
-best_r2 <- max(xgb_results$Rsquared)
-cat("Best modeling RMSE:", best_rmse, "\n")
-cat("Best modeling R2:", best_r2, "\n")
+best_model <- my_model$bestTune
+best_rmse <- min(model_results$RMSE)
+best_r2 <- max(model_results$Rsquared)
+cat("Best single-model RMSE:", best_rmse, "\n")
+cat("Best single-model R2:", best_r2, "\n")
 
 # 4. Visualize performance metrics (optional)
-plot(xgb_results$RMSE ~ xgb_results$nrounds, type = "l")  
+plot(model_results$RMSE ~ model_results$nrounds, type = "l")  
 
+# Get the feature names from your data
+feature_names <- colnames(train_dt_imputed[, -c("target", "Id")])  
+
+# Plot the first tree (index starts from 0)
+xgb.plot.tree(my_model$finalModel, feature_names = feature_names, trees = 0:1)
+
+rm(model_results, learning_curve, best_model, best_rmse, best_r2, feature_names)
+
+# nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+#   180         3    0.05   0.5      0.5                1       0.8
 ```
 
-## Score and evaluate holdout sample
+## Score and evaluate holdout validation sample
 
 ```{r}
 
-# Generate predictions using the trained model after preprocess
-pp_model <- preProcess(valid_dt, method = preprocess_steps)
-valid_dt_imputed <- predict(pp_model, valid_dt)
-predictions <- predict(xgb_model, newdata = valid_dt_imputed)
+#create validation predictions
+predictions <- predict(my_model, newdata = valid_dt_imputed)
 
 # Add the predictions to the validation data.table
 valid_dt_imputed[, predicted_value := predictions]
 
 postResample(pred = predictions, obs = valid_dt_imputed$target)
 
-cat("Best validation RMSE :", best_rmse, "\n")
+
+#calculate overall validation results
+validation_metric <- postResample(pred = predictions,
+                                  obs = valid_dt_imputed$target)
+cat("Single model Validation results: RMSE, Rsquared, MAE:", validation_metric)
+
+rm(pp_model, predictions)
 ```
 
-### Score submission file
+## Score submission file
 
-```{r eval=FALSE, include=FALSE}
-submission_file <- DT_test_model_data[, .(Id, predicted_value)]
+```{r}
+
+SalePrice <- predict(my_model, newdata = score_dt_imputed[, -c("Id")])
+
+submission_file <- score_dt_imputed[, .(Id, SalePrice)]
 
 # Write the results to a CSV file
-fwrite(submission_file, paste0(data_modeling_path, "model_scores.csv"))
-
+fwrite(submission_file, paste0(data_modeling_path, "single_model_scores.csv"))
+rm(SalePrice, submission_file)
 ```
 
 # [RUN SEGMENTATION MODELS]{.underline}
 
 ### Initialize objects
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 
 #create list object to collect model and scoring information
 models = list()
 
-#initialize table that contains all score and supporting data
-score_file <- data.table(
+#initialize table that contains validation score and supporting data
+score_file_valid <- data.table(
   Id = character(),
   target = numeric(),
   category = character(),
   score = numeric()
 )
+
+#initialize table that contains validation score and supporting data
+score_file_score <- data.table(
+  Id = character(),
+  category = character(),
+  score = numeric()
+)
+
 ```
 
 ### Create segmentation variable
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 #creates the segmentation variable
 #here are different options
-train_dt[, seg_var := as.factor(ifelse(OverallQual_treat > 6, 1, 2))]
-valid_dt[, seg_var := as.factor(ifelse(OverallQual_treat > 6, 1, 2))]
+train_dt_imputed[, seg_var := as.factor(ifelse(OverallQual_treat > 5, 1, 2))]
+valid_dt_imputed[, seg_var := as.factor(ifelse(OverallQual_treat > 5, 1, 2))]
+score_dt_imputed[, seg_var := as.factor(ifelse(OverallQual_treat > 5, 1, 2))]
 
-loop_input <- levels(train_dt$seg_var)
+#test single model
+# train_dt_imputed[, seg_var := as.factor("1")]
+# valid_dt_imputed[, seg_var := as.factor("1")]
+# score_dt_imputed[, seg_var := as.factor("1")]
+
+loop_input <- levels(train_dt_imputed$seg_var)
+
+
 #loop_input <- unique_categories[-2]  #clean what is not wanted
 ```
 
-### Create segmentation models
+### Run segmentation models
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 #loop through the segmentation
 for (category in loop_input) {
 
-#get the approriate data
-train_dt_segment <- train_dt[seg_var == category, ]
+#get the appropriate data
+train_dt_segment <- train_dt_imputed[seg_var == category]
 
 #create the model
 models[[paste0("m_", category)]] <- train(
-  x = train_dt_segment[, -c("target", "Id", "seg_var", "OverallQual_treat")],
+  x = train_dt_segment[, -c("target", "Id", "seg_var")],
   y = train_dt_segment$target,
   method = "xgbTree",
   trControl = fitcontrol,
-  preProcess = preprocess_steps,
   metric = metric_m,
   maximize = ifelse(metric_m %in% c("RMSE", "logLoss", "MAE", "logLoss"),
                     FALSE,
@@ -411,45 +468,96 @@ models[[paste0("m_", category)]] <- train(
   #tuneLength = 10,
   verbose = FALSE# Optional: Display training progress
 )
-
+rm(train_dt_segment)
 }
 ```
 
-### Validation scoring
+### Evaluate models
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 
+#calculate category model results
 for (category in loop_input) {
-#preprocess validaton- like the training sample
-pp_model <- preProcess(valid_dt[seg_var == category, -("seg_var")], method = preprocess_steps)
-
-#apply preprocessing
-valid_dt_imputed <- predict(pp_model, valid_dt[seg_var == category])
-
-#run prediction
-predictions <- round(predict(models[[paste0("m_", category)]], newdata = valid_dt_imputed),0)
-
-# fill initialized scores table 
-category_scores <- data.table(Id = valid_dt_imputed$Id, target = valid_dt_imputed$target, category = category, score = predictions)
-score_file <- rbind(score_file, category_scores)  # Append scores efficiently
-}
-```
-
-### Create evaluation metrics for segmentation models
-
-```{r paged.print=TRUE}
-for (category in loop_input) {
+#create category segments
 model_loop_results <- models[[paste0("m_", category)]]$results
 summary(model_loop_results)
 best_model <- models[[paste0("m_", category)]]$bestTune
 best_rmse <- min(model_loop_results$RMSE)
 best_r2 <- max(model_loop_results$Rsquared)
 print(best_model)
-cat("Best modeling RMSE for category",category,":", best_rmse, "\n")
-cat("Best modeling R2 for category" ,category,":",best_r2, "\n")
+cat("Best multi-model RMSE for category",category,":", best_rmse, "\n")
+cat("Best multi-model R2 for category" ,category,":",best_r2, "\n")
+
+print(varImp(models[[paste0("m_", category)]]))
+}
+
+rm(best_model, best_rmse, best_r2, validation_metric)
+```
+
+### Score and evaluate holdout validation sample
+
+```{r eval=FALSE, include=FALSE}
+
+for (category in loop_input) {
+#get the approriate data
+valid_dt_segment <- valid_dt_imputed[seg_var == category]
+  
+#run prediction
+predictions <- round(predict(models[[paste0("m_", category)]], 
+                             newdata = valid_dt_segment))
+
+# fill initialized scores table 
+category_scores <- data.table(Id = valid_dt_segment$Id, 
+                              target = valid_dt_segment$target,
+                              category = category,
+                              score = predictions)
+
+
+score_file_valid <- rbind(score_file_valid, category_scores)  # Append scores
+
+#calculate overall validation results
+validation_metric <- postResample(pred = score_file_valid$score,
+                                  obs = score_file_valid$target)
+cat("Multi-model Validation results for segment", category,": RMSE, Rsquared, MAE:", validation_metric)
 
 }
 
-validation_metric <-postResample(pred = score_file$score, obs = score_file$target)
-cat("Validation results are RMSE, Rsquared, MAE:", validation_metric)
+
+
+rm(category_scores)
+```
+
+### Create scoring table
+
+```{r eval=FALSE, include=FALSE}
+
+for (category in loop_input) {
+
+#create segments
+score_dt_segment <- score_dt_imputed[seg_var == category, -c("seg_var")]
+  
+#run prediction
+predictions <- round(predict(models[[paste0("m_", category)]], newdata = score_dt_segment),0)
+
+# fill initialized scores table 
+category_scores <- data.table(Id = score_dt_segment$Id,
+                                         category = category,
+                                         score = predictions)
+
+score_file_score <- rbind(score_file_score, category_scores)  # Append scores
+}
+
+```
+
+### Create submission file
+
+```{r eval=FALSE, include=FALSE}
+# Write the results to a CSV file
+
+
+submission_file_loop <- score_file_score[, .(Id, predictions)]
+fwrite(submission_file_loop, paste0(data_modeling_path, "loop_model_scores.csv"))
+
+
+rm(pp_model,, predictions, submission_file_loop)
 ```
